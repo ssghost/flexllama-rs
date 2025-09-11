@@ -169,10 +169,10 @@ fn main() -> io::Result<()> {
     
     let result = tokio_rt.block_on(async {
         info!("Starting application...");
-
-        let config_manager: Arc<<<std::result::Result<ConfigManager, anyhow::Error> as IntoFuture>::Output as Try>::Output> = Arc::new(ConfigManager::new().await?);
-        let runner_manager: Arc<<<std::result::Result<RunnerManager, anyhow::Error> as IntoFuture>::Output as Try>::Output> = Arc::new(RunnerManager::new(config_manager.clone(), "logs".into()).await?);
-        runner_manager.init_models_for_runners().await?;
+        let config_path = std::path::PathBuf::from("config.json");
+        let config_manager:Arc<std::result::Result<ConfigManager, anyhow::Error>>  = Arc::new(ConfigManager::new(config_path));
+        let runner_manager: Arc<std::result::Result<RunnerManager, anyhow::Error>> = Arc::new(RunnerManager::new(config_manager.clone(), "logs".into()));
+        runner_manager.init_models_for_runners().await;
         
         let shared_state = Arc::new(SharedAppState {
             selected_runner: Mutex::new(runner_manager.get_runner_names().first().cloned()),
