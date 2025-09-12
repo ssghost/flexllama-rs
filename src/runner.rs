@@ -3,7 +3,6 @@
 use std::{
     collections::{HashMap, HashSet},
     path::{Path, PathBuf},
-    process::Stdio,
     sync::Arc,
     time::Duration,
 };
@@ -20,7 +19,11 @@ use async_trait::async_trait;
 use reqwest::{Client, StatusCode};
 use serde::{Deserialize, Serialize};
 
-use crate::config::{ConfigManager, ModelConfig, RunnerConfig}; // Assuming config.rs is in the same crate
+use crate::config::{ConfigManager, ModelConfig, RunnerConfig};
+
+use std::os::unix::io::AsRawFd;
+use std::os::unix::io::FromRawFd;
+use std::process::Stdio;
 
 // Health Status Constants
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize, Serialize)]
@@ -66,11 +69,11 @@ pub struct RunnerProcess {
     pub port: u16,
     session_log_dir: PathBuf,
     process: Arc<Mutex<Option<Child>>>,
-    output_file: Arc<Mutex<Option<TokioFile>>>, // Use TokioFile for async file ops
-    models: Arc<RwLock<Vec<ModelConfig>>>, // Models this runner is responsible for
-    current_model: Arc<RwLock<Option<ModelConfig>>>, // Model currently loaded by the process
+    output_file: Arc<Mutex<Option<TokioFile>>>,
+    models: Arc<RwLock<Vec<ModelConfig>>>,
+    current_model: Arc<RwLock<Option<ModelConfig>>>,
     is_starting: Arc<Mutex<bool>>,
-    reqwest_client: Client, // Re-use reqwest client for health checks and forwarding
+    reqwest_client: Client,
 }
 
 impl RunnerProcess {
@@ -105,7 +108,13 @@ impl RunnerProcess {
     pub async fn get_model_by_alias(&self, model_alias: &str) -> Option<ModelConfig> {
         let models = self.models.read().await;
         models.iter().find(|m| {
-            m.model_alias.as_deref().unwrap_or_else(|| m.model.file_name().unwrap().to_string_lossy().as_ref()) == model_alias
+            if let Some(alias) = m.model_alias.as_deref() {
+                return alias == model_alias;
+            }
+            if let Some(file_name) = m.model.file_name() {
+                return file_name.to_string_lossy() == model_alias;
+            }
+            false
         }).cloned()
     }
 
@@ -113,17 +122,19 @@ impl RunnerProcess {
         let current_model_lock = self.current_model.read().await;
         match current_model_lock.as_ref() {
             Some(model_config) => {
-                let current_alias = model_config.model_alias.as_deref().unwrap_or_else(|| {
-                    model_config.model.file_name().unwrap().to_string_lossy().as_ref()
-                });
-                current_alias == model_alias
+                if let Some(alias) = model_config.model_alias.as_deref() {
+                    return alias == model_alias;
+                }
+                if let Some(file_name) = model_config.model.file_name() {
+                    return file_name.to_string_lossy() == model_alias;
+                }
+                false
             }
             None => false,
         }
     }
 
     pub async fn start_with_model(&self, model_alias: &str) -> Result<bool> {
-        // Find the model configuration
         let model_config = self.get_model_by_alias(model_alias).await;
         let model_config = match model_config {
             Some(cfg) => cfg,
@@ -133,7 +144,6 @@ impl RunnerProcess {
             }
         };
 
-        // Check if this model is already loaded and runner is active
         if self.is_running().await? && self.is_model_loaded(model_alias).await {
             info!(
                 "Model {} is already loaded in runner {}",
@@ -147,8 +157,7 @@ impl RunnerProcess {
 
         if is_starting_lock.to_owned() {
             info!("Runner {} is already starting", self.runner_name);
-            // Wait for the existing start process to complete
-            drop(is_starting_lock); // Release lock before awaiting
+            drop(is_starting_lock);
             loop {
                 sleep(Duration::from_millis(500)).await;
                 let is_starting_check = self.is_starting.lock().await;
@@ -156,35 +165,42 @@ impl RunnerProcess {
                     break;
                 }
             }
-            // After loop, re-check if it successfully started
             return Ok(process_lock.is_some() && process_lock.as_mut().unwrap().try_wait()?.is_none());
         }
 
-        // If a different model is loaded, stop the runner first
         if process_lock.is_some() && !self.is_model_loaded(model_alias).await {
-            let current_alias = self.current_model.read().await.as_ref().map(|m|
-                m.model_alias.as_deref().unwrap_or_else(|| m.model.file_name().unwrap().to_string_lossy().as_ref())
-            ).unwrap_or("unknown");
+            let current_alias = {
+                let current_model_lock = self.current_model.read().await;
+                if let Some(model_config) = current_model_lock.as_ref() {
+                    if let Some(alias) = model_config.model_alias.as_deref() {
+                        alias.to_string()
+                    } else if let Some(file_name) = model_config.model.file_name() {
+                        file_name.to_string_lossy().into_owned()
+                    } else {
+                        "unknown".to_string()
+                    }
+                } else {
+                    "unknown".to_string()
+                }
+            };
             info!(
                 "Switching runner {} from model {} to {}",
                 self.runner_name, current_alias, model_alias
             );
-            drop(process_lock); // Release lock before stopping
+            drop(process_lock);
             self.stop().await?;
-            process_lock = self.process.lock().await; // Re-acquire lock
+            process_lock = self.process.lock().await;
         }
 
-        // Start with the specified model
         *is_starting_lock = true;
-        drop(is_starting_lock); // Release is_starting_lock early
+        drop(is_starting_lock);
 
         let result = self._start_with_specific_model(&mut process_lock, &model_config).await;
         
-        *self.is_starting.lock().await = false; // Reset is_starting flag
+        *self.is_starting.lock().await = false;
         result
     }
 
-    // Default start function, uses the first model assigned to this runner
     pub async fn start(&self) -> Result<bool> {
         let models_guard = self.models.read().await;
         if models_guard.is_empty() {
@@ -192,14 +208,14 @@ impl RunnerProcess {
             return Ok(false);
         }
         let first_model_config = models_guard[0].clone();
-        drop(models_guard); // Release read lock before acquiring write lock for process
+        drop(models_guard);
 
         let mut process_lock = self.process.lock().await;
         let mut is_starting_lock = self.is_starting.lock().await;
 
         if is_starting_lock.to_owned() {
             info!("Runner {} is already starting", self.runner_name);
-            drop(is_starting_lock); // Release lock before awaiting
+            drop(is_starting_lock);
             loop {
                 sleep(Duration::from_millis(500)).await;
                 let is_starting_check = self.is_starting.lock().await;
@@ -211,11 +227,11 @@ impl RunnerProcess {
         }
 
         *is_starting_lock = true;
-        drop(is_starting_lock); // Release is_starting_lock early
+        drop(is_starting_lock);
 
         let result = self._start_with_specific_model(&mut process_lock, &first_model_config).await;
         
-        *self.is_starting.lock().await = false; // Reset is_starting flag
+        *self.is_starting.lock().await = false;
         result
     }
 
@@ -225,78 +241,85 @@ impl RunnerProcess {
             return Ok(true);
         }
 
-        // Build command
         let cmd = self.build_command(model_config)?;
         let log_dir = &self.session_log_dir;
-        tokio::fs::create_dir_all(log_dir).await?; // Ensure log directory exists
+        tokio::fs::create_dir_all(log_dir).await?;
 
         let log_file_path = log_dir.join(format!("{}.log", self.runner_name));
         let log_file = TokioFile::options()
             .create(true)
-            .append(true) // Append to preserve logs across restarts
+            .append(true)
             .open(&log_file_path)
             .await?;
         
-        let model_alias = model_config.model_alias.as_deref().unwrap_or_else(|| {
-            model_config.model.file_name().unwrap().to_string_lossy().as_ref()
-        });
+        let current_alias = if let Some(alias) = model_config.model_alias.as_deref() {
+            alias.to_string()
+        } else if let Some(file_name) = model_config.model.file_name() {
+            file_name.to_string_lossy().into_owned()
+        } else {
+            "unknown".to_string()
+        };
 
-        info!("Starting runner {} with model {}", self.runner_name, model_alias);
+        info!("Starting runner {} with model {}", self.runner_name, current_alias);
         debug!("Command: {:?}", cmd);
         info!("Log file: {:?}", log_file_path);
 
         let mut output_file_lock = self.output_file.lock().await;
         *output_file_lock = Some(log_file);
         let log_file_ref = output_file_lock.as_ref().unwrap();
+        let log_file_fd = log_file_ref.as_raw_fd();
 
-        // Write separator for new start
         tokio::io::AsyncWriteExt::write_all(
             &mut log_file_ref.try_clone().await?,
-            format!("\n=== Starting with model {} at {} ===\n", model_alias, chrono::Local::now().format("%Y-%m-%d %H:%M:%S")).as_bytes()
+            format!("\n=== Starting with model {} at {} ===\n", current_alias, chrono::Local::now().format("%Y-%m-%d %H:%M:%S")).as_bytes()
         ).await?;
         tokio::io::AsyncWriteExt::flush(&mut log_file_ref.try_clone().await?).await?;
 
-        // Start process
-        let child = Command::new(&cmd[0])
+        let mut child = Command::new(&cmd[0])
             .args(&cmd[1..])
-            .stdout(Stdio::from(log_file_ref.try_clone().await?))
-            .stderr(Stdio::from(log_file_ref.try_clone().await?))
+            .stdout(unsafe { Stdio::from_raw_fd(log_file_fd) })
+            .stderr(unsafe { Stdio::from_raw_fd(log_file_fd) })
             .spawn()
             .with_context(|| format!("Failed to spawn process for runner {}", self.runner_name))?;
 
-        *process_lock = Some(child);
+        //(*process_lock).replace(child);
 
-        // Initial wait
         sleep(Duration::from_secs(2)).await;
 
-        // Check if process is still running after initial wait
+        if child.try_wait()?.is_some() {
+            error!(
+                "Runner {} exited immediately with code: {:?}",
+                self.runner_name, child.try_wait()?.unwrap().code()
+            );
+            // Note: process_lock is not replaced, so cleanup is not needed here
+            return Ok(false);
+}
+
         if process_lock.as_mut().unwrap().try_wait()?.is_some() {
             error!(
                 "Runner {} exited immediately with code: {:?}",
-                self.runner_name, process_lock.as_ref().unwrap().try_wait()?.unwrap().code()
+                self.runner_name, process_lock.as_mut().unwrap().try_wait()?.unwrap().code()
             );
-            self.cleanup_runner_state(process_lock).await;
+            process_lock.replace(child);
             return Ok(false);
         }
 
-        // Wait for server to be ready
         let max_retries = 30;
         let retry_interval_ms = 1000;
         for i in 0..max_retries {
             if self._is_server_ready().await {
                 info!(
                     "Runner {} started successfully with model {}",
-                    self.runner_name, model_alias
+                    self.runner_name, current_alias
                 );
                 *self.current_model.write().await = Some(model_config.clone());
                 return Ok(true);
             }
 
-            // Check if process has exited during readiness check
             if process_lock.as_mut().unwrap().try_wait()?.is_some() {
                 error!(
                     "Runner {} exited during readiness check with code: {:?}",
-                    self.runner_name, process_lock.as_ref().unwrap().try_wait()?.unwrap().code()
+                    self.runner_name, process_lock.as_mut().unwrap().try_wait()?.unwrap().code()
                 );
                 self.cleanup_runner_state(process_lock).await;
                 return Ok(false);
@@ -309,7 +332,6 @@ impl RunnerProcess {
             sleep(Duration::from_millis(retry_interval_ms)).await;
         }
 
-        // Server did not start in time
         error!("Runner {} did not start in time", self.runner_name);
         self.stop().await?;
         Ok(false)
@@ -322,35 +344,37 @@ impl RunnerProcess {
             return Ok(true);
         }
 
-        let current_alias = self.current_model.read().await.as_ref().map(|m|
-            m.model_alias.as_deref().unwrap_or_else(|| m.model.file_name().unwrap().to_string_lossy().as_ref())
-        ).unwrap_or("unknown");
-        info!(
-            "Stopping runner {} (current model: {})",
-            self.runner_name, current_alias
-        );
+        let current_alias = {
+            let current_model_lock = self.current_model.read().await;
+            if let Some(model_config) = current_model_lock.as_ref() {
+                if let Some(alias) = model_config.model_alias.as_deref() {
+                    alias.to_string()
+                } else if let Some(file_name) = model_config.model.file_name() {
+                    file_name.to_string_lossy().into_owned()
+                } else {
+                    "unknown".to_string()
+                }
+            } else {
+                "unknown".to_string()
+            }
+        };
 
-        // Try graceful termination first
         if let Some(child) = process_lock.as_mut() {
             child.start_kill()?;
         }
 
-        // Wait for process to terminate
         for _ in 0..50 {
-            // 5 seconds with 0.1s intervals
             if process_lock.as_mut().unwrap().try_wait()?.is_some() {
                 break;
             }
             sleep(Duration::from_millis(100)).await;
         }
 
-        // If still running, force kill
         if process_lock.as_mut().unwrap().try_wait()?.is_none() {
             warn!("Runner {} did not terminate gracefully, forcing kill", self.runner_name);
             if let Some(child) = process_lock.as_mut() {
                 child.kill().await?;
             }
-            // Wait again
             for _ in 0..50 {
                 if process_lock.as_mut().unwrap().try_wait()?.is_some() {
                     break;
@@ -359,41 +383,52 @@ impl RunnerProcess {
             }
         }
         
-        let exit_code = process_lock.as_ref().unwrap().try_wait()?.map(|s| s.code()).flatten();
+        let exit_code: Option<i32> = process_lock.as_mut().unwrap().try_wait()?.map(|s| s.code()).flatten();
         info!("Runner {} stopped with exit code: {:?}", self.runner_name, exit_code);
 
-        self.cleanup_runner_state(process_lock).await;
+        self.cleanup_runner_state(&mut process_lock).await;
 
-        // Wait to offload GPU memory (small delay)
         sleep(Duration::from_millis(500)).await;
 
         Ok(true)
     }
 
-    async fn cleanup_runner_state(&self, mut process_lock: tokio::sync::MutexGuard<'_, Option<Child>>) {
-        // Close log file
+    async fn cleanup_runner_state(&self, process_lock: &mut tokio::sync::MutexGuard<'_, Option<Child>>) {
         let mut output_file_lock = self.output_file.lock().await;
         if let Some(file) = output_file_lock.take() {
-            drop(file); // Drops the TokioFile, closing it
+            drop(file);
         }
 
-        // Reset process and current_model
-        *process_lock = None;
-        *self.current_model.write().await = None;
+        process_lock.take();
+        (*self.current_model.write().await) = None;
     }
 
     pub async fn is_running(&self) -> Result<bool> {
         let mut process_lock = self.process.lock().await;
-        if let Some(child) = process_lock.as_mut() {
+        if let Some(mut child) = process_lock.as_mut() {
             if let Some(status) = child.try_wait()? {
-                let current_alias = self.current_model.read().await.as_ref().map(|m|
-                    m.model_alias.as_deref().unwrap_or_else(|| m.model.file_name().unwrap().to_string_lossy().as_ref())
-                ).unwrap_or("unknown");
+                let current_alias = {
+                    // Fix: Bind the RwLockReadGuard to a variable to extend its lifetime
+                    let current_model_lock = self.current_model.read().await;
+
+                    // Now, safely get a reference to the inner Option
+                    if let Some(model_config) = current_model_lock.as_ref() {
+                        if let Some(alias) = model_config.model_alias.as_deref() {
+                            alias.to_string()
+                        } else if let Some(file_name) = model_config.model.file_name() {
+                            file_name.to_string_lossy().into_owned()
+                        } else {
+                            "unknown".to_string()
+                        }
+                    } else {
+                        "unknown".to_string()
+                    }
+                };
                 warn!(
                     "Runner {} has exited with code: {:?} (was running model: {})",
                     self.runner_name, status.code(), current_alias
                 );
-                self.cleanup_runner_state(process_lock).await;
+                self.cleanup_runner_state(&mut process_lock).await;
                 Ok(false)
             } else {
                 Ok(true)
@@ -530,33 +565,23 @@ impl RunnerProcess {
 pub struct RunnerManager {
     config_manager: Arc<ConfigManager>,
     pub runners: HashMap<String, Arc<RunnerProcess>>,
-    model_runner_map: HashMap<String, String>, // model_alias -> runner_name
+    model_runner_map: HashMap<String, String>,
     session_log_dir: PathBuf,
     reqwest_client: Client,
 }
 
 impl RunnerManager {
-    pub fn new(config_manager: Arc<ConfigManager>, session_log_dir: PathBuf) -> Result<Self> {
+    pub async fn new(config_manager: Arc<ConfigManager>, session_log_dir: PathBuf) -> Result<Self> {
         let mut runners = HashMap::new();
         let mut model_runner_map = HashMap::new();
-
-        // Initialize runner processes
+        
         for runner_name in config_manager.get_runner_names() {
             let runner_config = config_manager.get_runner_config(&runner_name)
                 .ok_or_else(|| anyhow::anyhow!("Runner config for {} not found", runner_name))?;
             
-            // Resolve runner host and port, falling back to API config or auto-assignment later
             let host = runner_config.host.clone().unwrap_or_else(|| config_manager.get_api_host().to_string());
-            let port = runner_config.port.unwrap_or_else(|| {
-                // In a real implementation, you'd have a more robust auto-port assignment logic
-                warn!("Runner '{}': 'port' not specified, a fixed default or dynamic assignment should be implemented here.", runner_name);
-                // For now, let's pick an arbitrary default or error if not found in config
-                // This is a placeholder, a proper dynamic port allocation would be complex here.
-                // For now, if config doesn't provide port, this will be a problem later.
-                // Assuming all runner ports are explicitly defined in config_example.json
-                0 // This should ideally be dynamically assigned or an error if not in config
-            });
-
+            let port = runner_config.port.unwrap_or_else(|| 0);
+            
             runners.insert(
                 runner_name.clone(),
                 Arc::new(RunnerProcess::new(
@@ -569,7 +594,6 @@ impl RunnerManager {
             );
         }
 
-        // Assign models to runners
         for model_config in config_manager.get_config().models.iter() {
             let model_alias = model_config.model_alias.clone().unwrap_or_else(|| {
                 model_config.model.file_name().unwrap().to_string_lossy().into_owned()
@@ -577,11 +601,6 @@ impl RunnerManager {
             let runner_name = model_config.runner.clone();
 
             if let Some(runner_process) = runners.get(&runner_name) {
-                // Add model to the runner. This is an async operation, but `new` is sync.
-                // We'll queue these up to be added after construction, or adjust RunnerProcess::new to be async
-                // For simplicity now, we'll make add_model async later and call it after construction
-                // Alternatively, RunnerProcess could take an initial list of models.
-                // For now, let's keep model assignment simple for constructor and add async_trait for add_model
             } else {
                 error!(
                     "Model {} references unknown runner {}",
@@ -598,12 +617,6 @@ impl RunnerManager {
             session_log_dir,
             reqwest_client: Client::new(),
         };
-
-        // Now, asynchronously add models to runners after all runners are initialized
-        // This requires an async context, so we'll do it from `main` or a separate `init` method.
-        // For now, the models field in RunnerProcess remains empty after construction.
-        // A better design might be to pass models during RunnerProcess construction,
-        // or have an async init method for RunnerManager.
 
         Ok(manager)
     }
@@ -750,8 +763,11 @@ impl RunnerManager {
     }
 
     pub async fn get_current_model_for_runner(&self, runner_name: &str) -> Option<String> {
-        self.runners.get(runner_name)
-            .and_then(|runner| Some(runner.get_current_model_alias().await?))
+        self.runners.get(runner_name).and_then(|runner| {
+            tokio::runtime::Handle::current().block_on(async {
+                runner.get_current_model_alias().await
+            })
+        })
     }
 
     pub async fn switch_model(&self, from_model_alias: &str, to_model_alias: &str) -> Result<bool> {
@@ -810,7 +826,6 @@ impl RunnerManager {
                 debug!("Checking model readiness for {}", model_alias);
             }
 
-            // Ensure model is started
             if !self.is_model_available(model_alias).await.unwrap_or(false) {
                 info!("Starting runner for model {}", model_alias);
                 if !self.start_runner_for_model(model_alias).await.unwrap_or(false) {
@@ -822,11 +837,9 @@ impl RunnerManager {
                 }
             }
 
-            // Wait for the newly started model to become ready
             debug!("Waiting for newly started model {} to become ready", model_alias);
             self._wait_for_model_readiness(model_alias, 30).await;
 
-            // Do a pre-flight readiness check
             let (is_ready, readiness_error) = self._check_model_readiness(model_alias).await;
             if !is_ready {
                 last_error = readiness_error.clone();
@@ -834,19 +847,16 @@ impl RunnerManager {
                     info!("Model {} not ready: {}", model_alias, err_msg);
                 }
                 if attempt < max_retries && (retry_on_loading || readiness_error.as_deref() != Some(HealthMessages::MODEL_LOADING)) {
-                    // Only continue retry if retry_on_loading is true or it's not a loading error
                     continue;
                 } else {
                     break;
                 }
             }
 
-            // Model is ready
             debug!("Model {} is ready", model_alias);
             return (true, None);
         }
 
-        // All retries exhausted
         error!(
             "Model readiness check for {} failed after {} attempts. Last error: {:?}",
             model_alias, max_retries + 1, last_error
@@ -866,8 +876,10 @@ impl RunnerManager {
                 let status = response.status();
                 if status.is_success() {
                     (true, None)
-                } else if status == StatusCode::SERVICE_UNAVAILABLE { // 503 Service Unavailable
-                    match response.json::<serde_json::Value>().await {
+                } else if status == StatusCode::SERVICE_UNAVAILABLE {
+                    let text = response.text().await.unwrap_or_default();
+                    let json_result: Result<serde_json::Value, _> = serde_json::from_str(&text);
+                    match json_result {
                         Ok(data) => {
                             let error_message = data["error"]["message"].as_str().unwrap_or("Unknown error").to_string();
                             if error_message.to_lowercase().contains("loading") {
@@ -877,7 +889,6 @@ impl RunnerManager {
                             }
                         },
                         Err(_) => {
-                            let text = response.text().await.unwrap_or_default();
                             if text.to_lowercase().contains("loading") {
                                 (false, Some(HealthMessages::MODEL_LOADING.to_string()))
                             } else {
@@ -937,7 +948,7 @@ impl RunnerManager {
             }
         };
 
-        let url = format!("http://{}{}", runner.port, endpoint); // Use runner.host and runner.port
+        let url = format!("http://{}:{}{}", runner.host, runner.port, endpoint);
 
         match self.reqwest_client.post(&url)
             .json(&request_data)
@@ -959,9 +970,9 @@ impl RunnerManager {
             Err(e) => {
                 error!("Client error forwarding to {}: {}", url, e);
                 let status_code = if e.is_timeout() {
-                    StatusCode::REQUEST_TIMEOUT // 408
+                    StatusCode::REQUEST_TIMEOUT
                 } else {
-                    StatusCode::SERVICE_UNAVAILABLE // 503
+                    StatusCode::SERVICE_UNAVAILABLE
                 };
                 (
                     false,
@@ -976,8 +987,8 @@ impl RunnerManager {
         let (is_ready, error_message) = self._check_model_readiness(model_alias).await;
         serde_json::json!({
             "status": if is_ready { HealthStatus::Ok.as_str() } else { HealthStatus::Error.as_str() },
-            "message": if is_ready { HealthMessages::READY } else { error_message.unwrap_or_else(|| HealthMessages::HEALTH_CHECK_FAILED.to_string()) },
-            "model_alias": model_alias,
+           "message": if is_ready { HealthMessages::READY.to_string() } else { error_message.unwrap_or_else(|| HealthMessages::HEALTH_CHECK_FAILED.to_string()) },
+           "model_alias": model_alias,
         })
     }
 }
