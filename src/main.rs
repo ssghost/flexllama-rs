@@ -1,6 +1,6 @@
 // src/main.rs
 
-use std::{cell::RefCell, io, rc::Rc, sync::Arc, collections::HashMap};
+use std::{path::PathBuf, io, rc::Rc, sync::Arc, collections::HashMap};
 use tokio::sync::{Mutex, RwLock}; // Fix for 'sync is private'
 use ratatui::{
     layout::Alignment,
@@ -157,7 +157,7 @@ async fn update_status_loop(shared_state: Arc<SharedAppState>, runner_manager: A
     }
 }
 
-fn main() -> io::Result<()> {
+fn main() -> anyhow::Result<()> {
     let subscriber = FmtSubscriber::builder()
         .with_max_level(Level::INFO)
         .finish();
@@ -169,9 +169,12 @@ fn main() -> io::Result<()> {
     
     let result = tokio_rt.block_on(async {
         info!("Starting application...");
-        let config_path = std::path::PathBuf::from("config.json");
-        let config_manager:Arc<std::result::Result<ConfigManager, anyhow::Error>>  = Arc::new(ConfigManager::new(config_path));
-        let runner_manager: Arc<std::result::Result<RunnerManager, anyhow::Error>> = Arc::new(RunnerManager::new(config_manager.clone(), "logs".into()));
+
+        // Fix: Properly handle Result before wrapping in Arc
+        let config_path = PathBuf::from("config.json");
+        let config_manager = Arc::new(ConfigManager::new(config_path).await?);
+
+        let runner_manager = Arc::new(RunnerManager::new(config_manager.clone(), "logs".into()).await?);
         runner_manager.init_models_for_runners().await;
         
         let shared_state = Arc::new(SharedAppState {
@@ -202,8 +205,8 @@ fn main() -> io::Result<()> {
         
         let app = Rc::new(App { shared_state: Arc::clone(&shared_state), runner_manager: runner_manager.clone() });
         
-        let backend = DomBackend::new()?;
-        let terminal = Terminal::new(backend)?;
+        let backend = DomBackend::new().map_err(|e| anyhow::anyhow!("{}", e))?;
+        let terminal = Terminal::new(backend).map_err(|e| anyhow::anyhow!("{}", e))?;
 
         let event_state = Rc::clone(&app);
         terminal.on_key_event(move |key_event| {
